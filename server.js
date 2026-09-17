@@ -8,10 +8,9 @@ const { randomBytes } = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DB_FILE = path.join(__dirname, 'data.json');
-
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(cors());
-app.use(express.json({ limit: '50k
-app.use(express.static(__dirname));
+app.use(express.json({ limit
 // ---------------------------------------------------------------
 // Storage: a JSON file on disk, with a write queue so concurrent
 // requests never corrupt it. Fine for an MVP; swap for a real
