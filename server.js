@@ -1,47 +1,24 @@
-const express = require('express');
+  const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const fs = require('fs');
 const path = require('path');
-const { randomBytes } = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'data.json');
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables. Set these in your Render dashboard under Environment.');
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 app.use(cors());
 app.use(express.json({ limit: '50kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
-
-// ---------------------------------------------------------------
-// Storage: a JSON file on disk, with a write queue so concurrent
-// requests never corrupt it. Fine for an MVP; swap for a real
-// database (Postgres/Supabase) once traffic grows — see README.
-// ---------------------------------------------------------------
-let writeQueue = Promise.resolve();
-
-function loadDB() {
-  try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch (e) {
-    return { posts: [] };
-  }
-}
-
-function saveDB(data) {
-  writeQueue = writeQueue.then(() => new Promise((resolve, reject) => {
-    fs.writeFile(DB_FILE, JSON.stringify(data, null, 2), (err) => {
-      if (err) reject(err); else resolve();
-    });
-  }));
-  return writeQueue;
-}
-
-let db = loadDB();
-
-function genId() {
-  return randomBytes(8).toString('hex');
-}
 
 const ADJ = ['Quiet', 'Gentle', 'Wandering', 'Hushed', 'Steady', 'Weary', 'Hopeful', 'Tender', 'Calm', 'Restless'];
 const NOUN = ['Fox', 'Sparrow', 'Willow', 'Harbor', 'Ember', 'Wren', 'Moth', 'River', 'Owl', 'Lantern'];
@@ -54,8 +31,6 @@ function makeAnonName() {
 
 const MOODS = ['Heartbreak', 'Anxiety', 'Family', 'Work', 'Loneliness', 'Just venting', 'Other'];
 
-// Basic abuse guardrails. Not a substitute for real moderation at scale
-// (see README) but stops naive spam/flood scripts.
 const postLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 8,
@@ -71,63 +46,98 @@ const replyLimiter = rateLimit({
   message: { error: 'Slow down a little — try again in a few minutes.' }
 });
 
+function shapePost(p) {
+  return {
+    id: p.id,
+    text: p.text,
+    mood: p.mood,
+    anonName: p.anon_name,
+    createdAt: new Date(p.created_at).getTime(),
+    flagCount: p.flag_count,
+    hidden: p.hidden,
+    replies: (p.replies || [])
+      .map(r => ({ id: r.id, text: r.text, anonName: r.anon_name, createdAt: new Date(r.created_at).getTime() }))
+      .sort((a, b) => a.createdAt - b.createdAt)
+  };
+}
+
 // ---------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------
 app.get('/api/moods', (req, res) => res.json(MOODS));
 
-app.get('/api/posts', (req, res) => {
+app.get('/api/posts', async (req, res) => {
   const mood = req.query.mood;
   const sort = req.query.sort || 'newest';
-  let posts = db.posts.filter(p => !p.hidden);
-  if (mood && mood !== 'All') posts = posts.filter(p => p.mood === mood);
-  posts = posts.slice();
+
+  let query = supabase.from('posts').select('*, replies(*)').eq('hidden', false);
+  if (mood && mood !== 'All') query = query.eq('mood', mood);
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: 'Could not load posts.' });
+
+  let posts = data.map(shapePost);
   if (sort === 'discussed') {
-    posts.sort((a, b) => (b.replies || []).length - (a.replies || []).length || b.createdAt - a.createdAt);
+    posts.sort((a, b) => b.replies.length - a.replies.length || b.createdAt - a.createdAt);
   } else {
     posts.sort((a, b) => b.createdAt - a.createdAt);
   }
   res.json(posts.slice(0, 200));
 });
 
-app.post('/api/posts', postLimiter, (req, res) => {
+app.post('/api/posts', postLimiter, async (req, res) => {
   const text = (req.body.text || '').trim();
   const mood = req.body.mood;
   if (!text || text.length > 2000) return res.status(400).json({ error: 'Post must be 1-2000 characters.' });
   if (!MOODS.includes(mood)) return res.status(400).json({ error: 'Invalid mood.' });
-  const post = {
-    id: genId(),
-    text,
-    mood,
-    anonName: makeAnonName(),
-    createdAt: Date.now(),
-    replies: [],
-    flagCount: 0,
-    hidden: false
-  };
-  db.posts.push(post);
-  saveDB(db).catch(() => {});
-  res.json(post);
+
+  const { data, error } = await supabase
+    .from('posts')
+    .insert({ text, mood, anon_name: makeAnonName() })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: 'Could not save that post.' });
+  res.json(shapePost({ ...data, replies: [] }));
 });
 
-app.post('/api/posts/:id/replies', replyLimiter, (req, res) => {
-  const post = db.posts.find(p => p.id === req.params.id);
-  if (!post || post.hidden) return res.status(404).json({ error: 'Post not found.' });
+app.post('/api/posts/:id/replies', replyLimiter, async (req, res) => {
   const text = (req.body.text || '').trim();
   if (!text || text.length > 800) return res.status(400).json({ error: 'Reply must be 1-800 characters.' });
-  const reply = { id: genId(), text, anonName: makeAnonName(), createdAt: Date.now() };
-  post.replies.push(reply);
-  saveDB(db).catch(() => {});
-  res.json(reply);
+
+  const { data: post, error: postErr } = await supabase
+    .from('posts')
+    .select('id, hidden')
+    .eq('id', req.params.id)
+    .single();
+  if (postErr || !post || post.hidden) return res.status(404).json({ error: 'Post not found.' });
+
+  const { data, error } = await supabase
+    .from('replies')
+    .insert({ post_id: req.params.id, text, anon_name: makeAnonName() })
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: 'Could not save that reply.' });
+
+  res.json({ id: data.id, text: data.text, anonName: data.anon_name, createdAt: new Date(data.created_at).getTime() });
 });
 
-app.post('/api/posts/:id/flag', (req, res) => {
-  const post = db.posts.find(p => p.id === req.params.id);
-  if (!post) return res.status(404).json({ error: 'Post not found.' });
-  post.flagCount = (post.flagCount || 0) + 1;
-  if (post.flagCount >= 3) post.hidden = true;
-  saveDB(db).catch(() => {});
-  res.json({ ok: true, hidden: post.hidden });
+app.post('/api/posts/:id/flag', async (req, res) => {
+  const { data: post, error: getErr } = await supabase
+    .from('posts')
+    .select('flag_count')
+    .eq('id', req.params.id)
+    .single();
+  if (getErr || !post) return res.status(404).json({ error: 'Post not found.' });
+
+  const newFlags = (post.flag_count || 0) + 1;
+  const update = { flag_count: newFlags };
+  if (newFlags >= 3) update.hidden = true;
+
+  const { error } = await supabase.from('posts').update(update).eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: 'Could not flag that post.' });
+
+  res.json({ ok: true, hidden: newFlags >= 3 });
 });
 
 app.listen(PORT, () => console.log(`Solace server listening on port ${PORT}`));
